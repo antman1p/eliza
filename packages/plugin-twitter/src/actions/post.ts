@@ -29,7 +29,7 @@ async function composeTweet(
         const tweetContentObject = await generateObject({
             runtime,
             context,
-            modelClass: ModelClass.SMALL,
+            modelClass: ModelClass.LARGE,
             schema: TweetSchema,
             stop: ["\n"],
         });
