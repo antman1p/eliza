@@ -1078,15 +1078,20 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
         match_count: number;
         searchText?: string;
     }): Promise<RAGKnowledgeItem[]> {
-        const { data, error } = await this.supabase.rpc('match_knowledge', {
+        const tableName = this.getKnowledgeTableName(params.embedding);
+        elizaLogger.info(`Searching knowledge in ${tableName}`);
+
+        const { data, error } = await this.supabase.rpc('search_knowledge', {
+            query_table_name: tableName,
             query_embedding: Array.from(params.embedding),
+            query_agent_id: params.agentId,
             match_threshold: params.match_threshold,
             match_count: params.match_count,
-            p_agentid: params.agentId
+            search_text: params.searchText || ''
         });
 
         if (error) {
-            elizaLogger.error("Error searching knowledge:", error);
+            elizaLogger.error(`Error searching knowledge in ${tableName}:`, error);
             throw error;
         }
 
@@ -1102,34 +1107,39 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
 
     async createKnowledge(knowledge: RAGKnowledgeItem): Promise<void> {
         try {
-            elizaLogger.debug("SupabaseAdapter createKnowledge:", {
+            const tableName = this.getKnowledgeTableName(knowledge.embedding);
+            elizaLogger.info("SupabaseAdapter createKnowledge:", {
                 knowledgeId: knowledge.id,
                 agentId: knowledge.agentId,
+                tableName,
                 embeddingLength: knowledge.embedding?.length,
                 content: knowledge.content
             });
 
             const { error } = await this.supabase
-                .from('knowledge')
+                .from(tableName)
                 .insert({
-                    id: knowledge.id,
+                    // Generate new UUID if this is a chunk, otherwise use provided id
+                    id: knowledge.content.metadata?.isChunk ? uuid() : knowledge.id,
                     agentId: knowledge.content.metadata?.isShared ? null : knowledge.agentId,
                     content: knowledge.content,
                     embedding: knowledge.embedding ? Array.from(knowledge.embedding) : null,
-                    createdAt: knowledge.createdAt || new Date().toISOString(),
+                    createdAt: typeof knowledge.createdAt === 'number'
+                        ? new Date(knowledge.createdAt).toISOString()
+                        : knowledge.createdAt || new Date().toISOString(),
                     isMain: knowledge.content.metadata?.isMain || false,
-                    originalId: knowledge.content.metadata?.originalId,
+                    // Use the original ID from metadata if it exists
+                    originalId: knowledge.content.metadata?.originalId || null,
                     chunkIndex: knowledge.content.metadata?.chunkIndex,
                     isShared: knowledge.content.metadata?.isShared || false
                 });
 
             if (error) {
-                // Handle unique constraint violations (similar to SQLite's SQLITE_CONSTRAINT_PRIMARYKEY)
                 if (error.code === '23505' && knowledge.content.metadata?.isShared) {
-                    elizaLogger.debug(`Shared knowledge ${knowledge.id} already exists, skipping`);
+                    elizaLogger.info(`Shared knowledge ${knowledge.id} already exists, skipping`);
                     return;
                 }
-                elizaLogger.error(`Error creating knowledge ${knowledge.id}:`, {
+                elizaLogger.error(`Error creating knowledge in ${tableName}:`, {
                     error,
                     embeddingLength: knowledge.embedding?.length,
                     content: knowledge.content
@@ -1143,32 +1153,41 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
     }
 
     async removeKnowledge(id: UUID): Promise<void> {
-        const { error } = await this.supabase
-            .from('knowledge')
-            .delete()
-            .eq('id', id);
+        // Since we don't know which table the knowledge is in, try all tables
+        const tables = ['knowledge_1536', 'knowledge_1024', 'knowledge_768', 'knowledge_384'];
 
-        if (error) {
-            elizaLogger.error("Error removing knowledge:", error);
-            throw error;
+        for (const table of tables) {
+            const { error } = await this.supabase
+                .from(table)
+                .delete()
+                .eq('id', id);
+
+            if (error && error.code !== 'PGRST116') { // Ignore "not found" errors
+                elizaLogger.error(`Error removing knowledge from ${table}:`, error);
+                throw error;
+            }
         }
     }
 
     async clearKnowledge(agentId: UUID, shared?: boolean): Promise<void> {
-        let query = this.supabase
-            .from('knowledge')
-            .delete()
-            .eq('agentId', agentId);
+        const tables = ['knowledge_1536', 'knowledge_1024', 'knowledge_768', 'knowledge_384'];
 
-        if (shared) {
-            query = query.or('isShared.eq.true');
-        }
+        for (const table of tables) {
+            let query = this.supabase
+                .from(table)
+                .delete()
+                .eq('agentId', agentId);
 
-        const { error } = await query;
+            if (shared) {
+                query = query.or('isShared.eq.true');
+            }
 
-        if (error) {
-            elizaLogger.error("Error clearing knowledge:", error);
-            throw error;
+            const { error } = await query;
+
+            if (error) {
+                elizaLogger.error(`Error clearing knowledge from ${table}:`, error);
+                throw error;
+            }
         }
     }
 
@@ -1332,5 +1351,28 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
             });
             throw error;
         }
+    }
+
+    private getKnowledgeTableName(embedding?: Float32Array | number[]): string {
+        // If we have an embedding, use its actual size
+        if (embedding && (embedding instanceof Float32Array || Array.isArray(embedding))) {
+            const tableName = `knowledge_${embedding.length}`;
+            elizaLogger.debug(`getKnowledgeTableName: Using ${tableName} based on embedding length ${embedding.length}`);
+            return tableName;
+        }
+
+        // Otherwise get from config
+        const embeddingConfig = getEmbeddingConfig();
+        const modelSettings = getEmbeddingModelSettings(ModelProviderName[embeddingConfig.provider.toUpperCase() as keyof typeof ModelProviderName]);
+        const embeddingSize = modelSettings?.dimensions;
+
+        if (!embeddingSize) {
+            elizaLogger.warn('No embedding size found in config, using default 1024');
+            return 'knowledge_1024';
+        }
+
+        const tableName = `knowledge_${embeddingSize}`;
+        elizaLogger.debug(`getKnowledgeTableName: Using ${tableName} from config`);
+        return tableName;
     }
 }
