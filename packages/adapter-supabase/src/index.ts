@@ -118,37 +118,55 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
     }
 
     async init() {
-        // Check vector extension and schema
-        const vectorExt = await this.supabase.rpc('check_vector_extension');
-        if (!vectorExt.data) {
-            elizaLogger.error("Vector extension not found in database");
-            throw new Error("Vector extension required");
+        // Test connection first
+        try {
+            const { data, error } = await this.supabase
+                .from('app_config')
+                .select('key')
+                .limit(1);
+
+            if (error) {
+                elizaLogger.error("Failed to connect to Supabase:", error);
+                throw new Error("Database connection failed");
+            }
+
+            elizaLogger.debug("Successfully connected to Supabase");
+
+            // Now check vector extension
+            const vectorExt = await this.supabase.rpc('check_vector_extension');
+            if (!vectorExt.data) {
+                elizaLogger.error("Vector extension not found in database");
+                throw new Error("Vector extension required");
+            }
+
+            // Set embedding configuration based on provider and model
+            const embeddingConfig = getEmbeddingConfig();
+            const configQueries = [];
+
+            // Set provider-specific configuration
+            const providerValue = embeddingConfig.provider.toLowerCase();
+            configQueries.push(
+                this.supabase.rpc('set_config', {
+                    key: 'app.embedding_provider',
+                    value: providerValue
+                })
+            );
+
+            // Set embedding dimensions based on provider
+            const dimensions = this.getEmbeddingDimensions(embeddingConfig.provider, embeddingConfig.model);
+            configQueries.push(
+                this.supabase.rpc('set_config', {
+                    key: 'app.embedding_dimensions',
+                    value: dimensions.toString()
+                })
+            );
+
+            // Execute all configuration queries
+            await Promise.all(configQueries);
+        } catch (error) {
+            elizaLogger.error("Database initialization failed:", error);
+            throw error;
         }
-
-        // Set embedding configuration based on provider and model
-        const embeddingConfig = getEmbeddingConfig();
-        const configQueries = [];
-
-        // Set provider-specific configuration
-        const providerValue = embeddingConfig.provider.toLowerCase();
-        configQueries.push(
-            this.supabase.rpc('set_config', {
-                key: 'app.embedding_provider',
-                value: providerValue
-            })
-        );
-
-        // Set embedding dimensions based on provider
-        const dimensions = this.getEmbeddingDimensions(embeddingConfig.provider, embeddingConfig.model);
-        configQueries.push(
-            this.supabase.rpc('set_config', {
-                key: 'app.embedding_dimensions',
-                value: dimensions.toString()
-            })
-        );
-
-        // Execute all configuration queries
-        await Promise.all(configQueries);
     }
 
     private getEmbeddingDimensions(provider: string, modelName: string): number {
@@ -394,19 +412,38 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
         roomId: UUID;
         type: string;
     }): Promise<void> {
-        const { error } = await this.supabase
-            .from("logs")
-            .insert({
-                id: uuid(),
-                body: params.body,
-                userId: params.userId,
-                roomId: params.roomId,
+        try {
+            elizaLogger.debug("Attempting to insert log:", {
                 type: params.type,
+                userId: params.userId,
+                roomId: params.roomId
             });
 
-        if (error) {
-            elizaLogger.error("Error inserting log:", error);
-            throw new Error(error.message);
+            const { error } = await this.supabase
+                .from("logs")
+                .insert({
+                    id: uuid(),
+                    body: params.body,
+                    userId: params.userId,
+                    roomId: params.roomId,
+                    type: params.type,
+                    createdAt: new Date().toISOString()
+                });
+
+            if (error) {
+                elizaLogger.error("Error inserting log:", {
+                    error,
+                    params,
+                    errorCode: error.code,
+                    details: error.details
+                });
+                throw new Error(`Failed to insert log: ${error.message}`);
+            }
+
+            elizaLogger.debug("Successfully inserted log");
+        } catch (error) {
+            elizaLogger.error("Unexpected error in log function:", error);
+            throw error;
         }
     }
 
@@ -491,9 +528,9 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
             return [];
         }
 
-        if (!embedding.every(n => typeof n === 'number' && !isNaN(n))) {
+        if (!embedding.every(n => typeof n === 'number' && !Number.isNaN(n))) {
             elizaLogger.error("Invalid embedding values - must all be numbers", {
-                invalidValues: embedding.filter(n => typeof n !== 'number' || isNaN(n))
+                invalidValues: embedding.filter(n => typeof n !== 'number' || Number.isNaN(n))
             });
             return [];
         }
@@ -693,8 +730,8 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
         }
         const query = {
             query_table_name: tableName,
-            query_roomId: roomId,
-            query_unique: !!unique,
+            query_roomid: roomId,
+            query_unique: !!unique
         };
         const result = await this.supabase.rpc("count_memories", query);
 
@@ -726,9 +763,9 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
             }
 
             const opts = {
-                query_roomId: params.roomId,
-                query_userId: params.userId || null,
                 only_in_progress: params.onlyInProgress || false,
+                query_roomid: params.roomId,
+                query_userid: params.userId || null,
                 row_count: params.count || null
             };
 
@@ -1078,11 +1115,9 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
         match_count: number;
         searchText?: string;
     }): Promise<RAGKnowledgeItem[]> {
-        const tableName = this.getKnowledgeTableName(params.embedding);
-        elizaLogger.info(`Searching knowledge in ${tableName}`);
+        elizaLogger.debug(`Searching knowledge with embedding size ${params.embedding.length}`);
 
         const { data, error } = await this.supabase.rpc('search_knowledge', {
-            query_table_name: tableName,
             query_embedding: Array.from(params.embedding),
             query_agent_id: params.agentId,
             match_threshold: params.match_threshold,
@@ -1091,7 +1126,7 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
         });
 
         if (error) {
-            elizaLogger.error(`Error searching knowledge in ${tableName}:`, error);
+            elizaLogger.error(`Error searching knowledge:`, error);
             throw error;
         }
 
@@ -1108,7 +1143,7 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
     async createKnowledge(knowledge: RAGKnowledgeItem): Promise<void> {
         try {
             const tableName = this.getKnowledgeTableName(knowledge.embedding);
-            elizaLogger.info("SupabaseAdapter createKnowledge:", {
+            elizaLogger.debug("SupabaseAdapter createKnowledge:", {
                 knowledgeId: knowledge.id,
                 agentId: knowledge.agentId,
                 tableName,
@@ -1136,7 +1171,7 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
 
             if (error) {
                 if (error.code === '23505' && knowledge.content.metadata?.isShared) {
-                    elizaLogger.info(`Shared knowledge ${knowledge.id} already exists, skipping`);
+                    elizaLogger.debug(`Shared knowledge ${knowledge.id} already exists, skipping`);
                     return;
                 }
                 elizaLogger.error(`Error creating knowledge in ${tableName}:`, {
@@ -1363,7 +1398,7 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
 
         // Otherwise get from config
         const embeddingConfig = getEmbeddingConfig();
-        const modelSettings = getEmbeddingModelSettings(ModelProviderName[embeddingConfig.provider.toUpperCase() as keyof typeof ModelProviderName]);
+        const modelSettings = getEmbeddingModelSettings(ModelProviderName[embeddingConfig.provider.toUpperCase()]);
         const embeddingSize = modelSettings?.dimensions;
 
         if (!embeddingSize) {
